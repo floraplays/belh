@@ -20,35 +20,47 @@ const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.c
 const NIM_API_KEY  = process.env.NIM_API_KEY;
 
 // How many times to retry a request when NIM returns 429, 503, or 504.
+// Timeouts (ECONNABORTED) are NOT retried — retrying a hung connection
+// stacks more hung connections and can exhaust Render's memory.
 const MAX_RETRIES    = 2;
-const RETRY_DELAY_MS = 500; // reduced from 2000ms — retry faster within JanitorAI's patience window
+const RETRY_DELAY_MS = 500;
 
-// Per-model token limits. Large models on shared infrastructure generate slowly —
-// capping tokens to what RP actually needs reduces time-to-completion significantly.
+// Render only kills a connection if NO data is sent within its idle window.
+// For streaming responses, once the first token arrives the connection stays open.
+// 55 seconds gives the model enough queue time on busy days without risking
+// the stacking problem that caused 502s (which was from 180s hung requests).
+const REQUEST_TIMEOUT_MS = 55000;
+
+// Per-model token limits.
 const MODEL_MAX_TOKENS = {
-  'deepseek-ai/deepseek-v3.1-terminus': 800,
-  'deepseek-ai/deepseek-v3.2':          800,
-  'deepseek-ai/deepseek-v4-pro':        800,
-  'deepseek-ai/deepseek-v4-flash':      800,
+  'deepseek-ai/deepseek-v4-pro':   800,
+  'deepseek-ai/deepseek-v4-flash': 800,
+};
+
+// If V4-pro times out, try V4-flash before giving up.
+// V3.x models all retired as of May 4 2026 — no older fallback available.
+const FALLBACK_MODEL = {
+  'deepseek-ai/deepseek-v4-pro': 'deepseek-ai/deepseek-v4-flash',
 };
 
 // OpenAI alias -> NVIDIA NIM model ID.
-// Last verified: May 2026.
+// Last verified: May 9 2026.
+// v3.1-terminus retired April 15 2026, v3.2 retired May 4 2026 — both 410 Gone.
+// V4 models are the only live DeepSeek models on the hosted NIM API.
 const MODEL_MAPPING = {
-  'deepseek-terminus':  'deepseek-ai/deepseek-v3.1-terminus',
-  'deepseek-v3':        'deepseek-ai/deepseek-v3.2',
-  'deepseek-v4':        'deepseek-ai/deepseek-v4-pro',    // 1.6T params, 49B active, 1M context — newest
-  'deepseek-v4-flash':  'deepseek-ai/deepseek-v4-flash',  // 284B params, 13B active — faster V4
+  'deepseek-v4':       'deepseek-ai/deepseek-v4-pro',    // 1.6T params, 49B active
+  'deepseek-v4-flash': 'deepseek-ai/deepseek-v4-flash',  // 284B params, 13B active — faster
 };
 
-// V4 models hang permanently without chat_template_kwargs injected into the request body.
-// Their reasoning output goes into reasoning_content (already stripped), not inline.
+// V4 models require chat_template_kwargs to respond at all.
+// enable_thinking: false = Non-think (fast) mode — responses start immediately.
+// enable_thinking: true  = Think High/Max — model reasons before responding, causes timeouts.
 const REQUIRES_THINKING_PARAM = new Set([
   'deepseek-ai/deepseek-v4-pro',
   'deepseek-ai/deepseek-v4-flash',
 ]);
 
-// No current models emit inline <think> tags in their content field.
+// No current models emit inline <think> tags.
 const NATIVE_THINKERS = new Set([]);
 
 // Generation parameters forwarded verbatim to NIM when present on the request.
@@ -196,7 +208,7 @@ app.get('/v1/models', (req, res) => {
 // NIM request helper with retry logic
 // ---------------------------------------------------------------------------
 
-async function callNIM(nimBody, isStream, attemptNum, id) {
+async function callNIM(nimBody, isStream, id) {
   return axios.post(
     `${NIM_API_BASE}/chat/completions`,
     nimBody,
@@ -207,7 +219,7 @@ async function callNIM(nimBody, isStream, attemptNum, id) {
         'Accept':        isStream ? 'text/event-stream' : 'application/json',
       },
       responseType: isStream ? 'stream' : 'json',
-      timeout:      180000,
+      timeout:      REQUEST_TIMEOUT_MS,
     }
   );
 }
@@ -284,19 +296,41 @@ app.post('/v1/chat/completions', async (req, res) => {
   }
 
   // --- Call NIM with retry on transient errors ------------------------------
-  // Streaming responses cannot be retried once the response has begun, so
-  // retry only applies to the initial connection attempt.
   let response;
   let lastErr;
+  let activeModel = nimModel;
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    nimBody.model = activeModel;
+
+  // V4 models require this parameter or they hang indefinitely.
+  // enable_thinking: false = Non-think (fast) mode, responses start immediately.
+  if (REQUIRES_THINKING_PARAM.has(activeModel)) {
+    nimBody.chat_template_kwargs = { enable_thinking: false, thinking: false };
+  } else {
+    delete nimBody.chat_template_kwargs;
+  }
+
     try {
-      response = await callNIM(nimBody, isStream, attempt, id);
+      response = await callNIM(nimBody, isStream, id);
       lastErr  = null;
       break;
     } catch (err) {
       lastErr = err;
-      const status = err.response?.status;
+      const status  = err.response?.status;
+      const isTimeout = err.code === 'ECONNABORTED';
+
+      // On timeout, try falling back to the stable model before giving up
+      if (isTimeout && FALLBACK_MODEL[activeModel]) {
+        const fallback = FALLBACK_MODEL[activeModel];
+        console.warn(`[${now()}] [${id}] ${activeModel} timed out — falling back to ${fallback}`);
+        activeModel = fallback;
+        nimBody.max_tokens = MODEL_MAX_TOKENS[fallback] ?? 800;
+        continue;
+      }
+
+      // Do not retry timeouts — stacking hung connections exhausts Render memory
+      if (isTimeout) break;
 
       if (attempt < MAX_RETRIES && RETRYABLE_STATUSES.has(status)) {
         const wait = RETRY_DELAY_MS * (attempt + 1);
@@ -305,7 +339,6 @@ app.post('/v1/chat/completions', async (req, res) => {
         continue;
       }
 
-      // Non-retryable error or retries exhausted
       break;
     }
   }
@@ -465,14 +498,32 @@ function handleAxiosError(err, id, res) {
 
   // Distinguish timeout and connection reset from API errors for clearer logs
   if (err.code === 'ECONNABORTED') {
-    detail = `Request timed out after ${Math.round(180000 / 1000)}s with no response from NIM`;
+    detail = `Request timed out after ${REQUEST_TIMEOUT_MS / 1000}s with no response from NIM`;
   } else if (err.code === 'ECONNRESET') {
     detail = 'NIM closed the connection unexpectedly (likely server-side congestion)';
   } else if (err.response?.data) {
     const raw = err.response.data;
-    if (typeof raw === 'string')       detail = raw;
-    else if (Buffer.isBuffer(raw))     detail = raw.toString('utf8');
-    else if (typeof raw === 'object') {
+    if (typeof raw === 'string') {
+      detail = raw;
+    } else if (Buffer.isBuffer(raw)) {
+      detail = raw.toString('utf8');
+    } else if (raw && typeof raw.read === 'function') {
+      // Readable stream — happens when responseType is 'stream' and NIM returns a 4xx/5xx.
+      // The error body is already buffered internally; read it out synchronously.
+      try {
+        const chunks = [];
+        let chunk;
+        while (null !== (chunk = raw.read())) {
+          chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+        }
+        detail = chunks.length > 0
+          ? Buffer.concat(chunks).toString('utf8')
+          : `[Empty stream body — HTTP ${status}]`;
+      } catch (_) {
+        detail = `[Could not read stream error body — HTTP ${status}]`;
+      }
+    } else if (typeof raw === 'object') {
+      // Plain object — safe to stringify with circular reference guard
       try {
         const seen = new WeakSet();
         detail = JSON.stringify(raw, (key, value) => {
